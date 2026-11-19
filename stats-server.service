@@ -1,0 +1,14 @@
+[Unit]
+Description=LAN computer statistics server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/neonlightning/statsdisplay
+ExecStart=/usr/bin/python3 /home/neonlightning/statsdisplay/stats_server.py --host 0.0.0.0 --port 8282
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
