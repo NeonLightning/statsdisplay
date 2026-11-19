@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import socket
 
 
 class BitField(ctypes.Structure):
@@ -55,6 +56,8 @@ class FBFixScreenInfo(ctypes.Structure):
 
 FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
+FBIOBLANK = 0x4611
+VESA_NO_BLANKING = 0
 
 
 def log(message):
@@ -170,6 +173,14 @@ class DirectFramebuffer:
         self.mapping = mmap.mmap(
             self.fd, self.line_length * self.height, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ
         )
+        # DRM/KMS fbdev emulation starts some SPI connectors power-blanked. Writing
+        # pixels alone does not enable them, so force VESA_NO_BLANKING here.
+        try:
+            fcntl.ioctl(self.fd, FBIOBLANK, VESA_NO_BLANKING)
+        except OSError as exc:
+            self.mapping.close()
+            self.close_file()
+            raise RuntimeError(f"could not unblank framebuffer: {exc}") from exc
 
     @staticmethod
     def channel(value, field):
@@ -266,6 +277,26 @@ def arguments():
     return parser.parse_args()
 
 
+class SingleInstance:
+    """Prevent a manual and systemd copy from fighting over the display."""
+
+    def __init__(self):
+        self.path = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/stats-display.lock"
+        self.handle = open(self.path, "a+")
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.handle.close()
+            raise RuntimeError("another stats display client is already running") from exc
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(str(os.getpid()))
+        self.handle.flush()
+
+    def close(self):
+        self.handle.close()
+
+
 class Poller:
     def __init__(self, url, token):
         self.url, self.token = url, token
@@ -273,18 +304,30 @@ class Poller:
         self.connected = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        # Bypass environment proxies for direct LAN connections.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def run(self):
         log(f"Connecting to stats server: {self.url}")
+        delay = 1.0
+        max_response_size = 1024 * 1024
         while not self.stop_event.is_set():
+            started = time.monotonic()
             try:
-                headers = {"Accept": "application/json"}
+                headers = {
+                    "Accept": "application/json",
+                    "Connection": "close",
+                    "User-Agent": "stats-display/1.0",
+                }
                 if self.token:
                     headers["X-Stats-Token"] = self.token
                 request = urllib.request.Request(self.url, headers=headers)
-                with urllib.request.urlopen(request, timeout=3) as response:
-                    data = json.load(response)
+                with self.opener.open(request, timeout=4) as response:
+                    payload = response.read(max_response_size + 1)
+                if len(payload) > max_response_size:
+                    raise ValueError("server response is too large")
+                data = json.loads(payload)
                 if not isinstance(data, dict):
                     raise ValueError("invalid server response")
                 with self.lock:
@@ -293,21 +336,25 @@ class Poller:
                     self.connected = True
                 if not was_connected:
                     log(f"Connected to stats server: {self.url}")
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                delay = 1.0
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
                 with self.lock:
                     was_connected = self.connected
                     self.error = str(exc)
                     self.connected = False
                 if was_connected is not False:
                     log(f"Stats server disconnected: {exc}")
-            self.stop_event.wait(1.0)
+                delay = min(10.0, delay * 2.0)
+            # Keep successful polling near once per second, but back off failures.
+            remaining = max(0.1, delay - (time.monotonic() - started))
+            self.stop_event.wait(remaining)
 
     def start(self):
         self.thread.start()
 
     def stop(self):
         self.stop_event.set()
-        self.thread.join(timeout=2)
+        self.thread.join(timeout=5)
 
     def snapshot(self):
         with self.lock:
@@ -335,11 +382,42 @@ def shortened(value, limit=22):
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
+def local_addresses():
+    """Return active IPv4 addresses without shelling out or requiring DNS."""
+    addresses = []
+    try:
+        interfaces = sorted(os.listdir("/sys/class/net"))
+        control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for interface in interfaces:
+                if interface == "lo":
+                    continue
+                try:
+                    request = struct.pack("256s", interface.encode()[:15])
+                    response = fcntl.ioctl(control.fileno(), 0x8915, request)  # SIOCGIFADDR
+                    address = socket.inet_ntoa(response[20:24])
+                    if address != "0.0.0.0":
+                        addresses.append(f"{interface}  {address}")
+                except OSError:
+                    pass
+        finally:
+            control.close()
+    except OSError:
+        pass
+    return tuple(addresses)
+
+
 def main():
     args = arguments()
     try:
+        instance = SingleInstance()
+    except (OSError, RuntimeError) as exc:
+        log(f"Could not start display client: {exc}")
+        return 1
+    try:
         import pygame
     except ImportError:
+        instance.close()
         print("pygame is required: python3 -m pip install pygame", file=sys.stderr)
         return 2
 
@@ -354,6 +432,7 @@ def main():
             os.environ["SDL_INPUT_LINUXEV"] = "1"
             spi_card = "/dev/dri/by-path/platform-3f204000.spi-cs-0-card"
             os.environ.setdefault("SDL_KMSDRM_DEVICE", spi_card if os.path.exists(spi_card) else "/dev/dri/card0")
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
     pygame.init()
     try:
         backend = DisplayBackend(pygame, args)
@@ -361,6 +440,7 @@ def main():
     except (pygame.error, RuntimeError, OSError) as exc:
         log(f"Could not open display: {exc}")
         pygame.quit()
+        instance.close()
         return 2
     pygame.mouse.set_visible(args.desktop)
     touch_reader = TouchReader(args.touch_device) if backend.framebuffer else None
@@ -451,6 +531,8 @@ def main():
 
     running = True
     last_render_key = None
+    last_address_check = 0.0
+    addresses = local_addresses()
     while running:
         change = 1 if touch_reader and touch_reader.poll_press() else 0
         for event in pygame.event.get():
@@ -468,8 +550,12 @@ def main():
         page = (page + change) % len(titles)
 
         data, fetch_error = poller.snapshot()
+        now = time.time()
+        if now - last_address_check >= 2.0:
+            addresses = local_addresses()
+            last_address_check = now
         age = (
-            max(0, int(time.time() - float(data.get("timestamp", time.time()))))
+            max(0, int(now - float(data.get("timestamp", now))))
             if data else 0
         )
         render_key = (
@@ -477,6 +563,7 @@ def main():
             data.get("timestamp") if data else None,
             fetch_error,
             age,
+            addresses,
         )
         if render_key == last_render_key:
             clock.tick(15 if backend.framebuffer else 30)
@@ -498,9 +585,18 @@ def main():
             else:
                 put(f"updated {age:.0f}s ago", 16, args.height - 27, small_font, muted)
         else:
-            center("Waiting for stats server", 105, heading_font)
-            center(shortened(fetch_error, 62), 145, body_font, error_color)
-            center(args.url, 185, small_font, muted)
+            center("Connecting to stats server", 76, heading_font)
+            center(shortened(fetch_error, 62), 116, body_font, error_color)
+            if addresses:
+                center("LOCAL IP", 164, small_font, muted)
+                for index, address in enumerate(addresses[:3]):
+                    center(address, 188 + index * 21, body_font, accent)
+            else:
+                center("Waiting for Wi-Fi / IP address", 188, body_font, warn)
+            center(args.url, 256, small_font, muted)
+
+        if addresses:
+            center("  •  ".join(item.split()[-1] for item in addresses), args.height - 46, small_font, accent)
 
         center("TAP TO SWITCH", args.height - 25, small_font, magenta)
         backend.flip()
@@ -511,6 +607,7 @@ def main():
         touch_reader.close()
     backend.close()
     pygame.quit()
+    instance.close()
     return 0
 
 

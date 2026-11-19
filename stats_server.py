@@ -14,15 +14,17 @@ import psutil
 
 
 class Collector:
-    def __init__(self):
+    def __init__(self, interval=2.0):
+        self.interval = max(1.0, float(interval))
         self.lock = threading.Lock()
         self.data = {"timestamp": 0}
         self.previous_io = {}
         self.previous_time = 0.0
+        self.stop_event = threading.Event()
 
     def run(self):
         psutil.cpu_percent(None)
-        while True:
+        while not self.stop_event.is_set():
             started = time.monotonic()
             try:
                 sample = self.sample()
@@ -30,7 +32,10 @@ class Collector:
                     self.data = sample
             except Exception as exc:
                 print(f"Sample error: {exc}", flush=True)
-            time.sleep(max(0.0, 1.0 - (time.monotonic() - started)))
+            self.stop_event.wait(max(0.0, self.interval - (time.monotonic() - started)))
+
+    def stop(self):
+        self.stop_event.set()
 
     def sample(self):
         now = time.monotonic()
@@ -100,6 +105,11 @@ class Collector:
             return self.data
 
 
+class StatsHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 16
+
+
 def handler_for(collector, token):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -109,11 +119,12 @@ def handler_for(collector, token):
             if token and self.headers.get("X-Stats-Token") != token:
                 self.send_error(401, "Invalid or missing stats token")
                 return
-            body = json.dumps(collector.snapshot()).encode()
+            body = json.dumps(collector.snapshot(), separators=(",", ":")).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
 
@@ -130,18 +141,23 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8282)
     parser.add_argument("--token", default=os.environ.get("STATS_TOKEN", ""))
+    parser.add_argument("--interval", type=float, default=2.0, help="seconds between process samples")
     args = parser.parse_args()
 
-    collector = Collector()
-    threading.Thread(target=collector.run, daemon=True).start()
-    server = ThreadingHTTPServer((args.host, args.port), handler_for(collector, args.token))
+    collector = Collector(args.interval)
+    # Bind first: a duplicate instance must fail without starting an expensive collector.
+    server = StatsHTTPServer((args.host, args.port), handler_for(collector, args.token))
+    collector_thread = threading.Thread(target=collector.run, daemon=True)
+    collector_thread.start()
     print(f"Serving stats at http://{args.host}:{args.port}/stats")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        collector.stop()
         server.server_close()
+        collector_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

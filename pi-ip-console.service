@@ -1,0 +1,16 @@
+[Unit]
+Description=Display active network addresses on HDMI console
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/statsdisplay-ip-console
+Restart=always
+RestartSec=1
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target
