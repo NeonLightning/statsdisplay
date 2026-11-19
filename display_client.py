@@ -4,6 +4,7 @@
 import argparse
 import ctypes
 import fcntl
+from functools import lru_cache
 import json
 import mmap
 import os
@@ -299,7 +300,7 @@ class Poller:
                     self.connected = False
                 if was_connected is not False:
                     log(f"Stats server disconnected: {exc}")
-            self.stop_event.wait(0.5)
+            self.stop_event.wait(1.0)
 
     def start(self):
         self.thread.start()
@@ -374,16 +375,20 @@ def main():
     text, muted = (218, 250, 255), (105, 121, 158)
     accent, blue, warn, error_color = (0, 255, 204), (0, 210, 255), (255, 214, 58), (255, 42, 166)
     magenta, grid = (255, 42, 166), (24, 18, 52)
-    titles = ("SYSTEM", "")
+    titles = ("SYSTEM", "TOP PROCESSES")
     page = 0
     poller = Poller(args.url, args.token)
     poller.start()
 
+    @lru_cache(maxsize=256)
+    def render_text(font, value, color):
+        return font.render(str(value), True, color)
+
     def put(value, x, y, font=body_font, color=text):
-        screen.blit(font.render(str(value), True, color), (x, y))
+        screen.blit(render_text(font, str(value), color), (x, y))
 
     def center(value, y, font=body_font, color=text):
-        rendered = font.render(str(value), True, color)
+        rendered = render_text(font, str(value), color)
         screen.blit(rendered, ((args.width - rendered.get_width()) // 2, y))
 
     def bar(x, y, width, height, percent, color):
@@ -441,10 +446,11 @@ def main():
                     value = human_bytes(app.get("memory_bytes"))
                 else:
                     value = f"R {human_bytes(app.get('read_bps'))}  W {human_bytes(app.get('write_bps'))}/s"
-                rendered = small_font.render(value, True, color)
+                rendered = render_text(small_font, value, color)
                 screen.blit(rendered, (args.width - 26 - rendered.get_width(), y))
 
     running = True
+    last_render_key = None
     while running:
         change = 1 if touch_reader and touch_reader.poll_press() else 0
         for event in pygame.event.get():
@@ -462,10 +468,24 @@ def main():
         page = (page + change) % len(titles)
 
         data, fetch_error = poller.snapshot()
+        age = (
+            max(0, int(time.time() - float(data.get("timestamp", time.time()))))
+            if data else 0
+        )
+        render_key = (
+            page,
+            data.get("timestamp") if data else None,
+            fetch_error,
+            age,
+        )
+        if render_key == last_render_key:
+            clock.tick(15 if backend.framebuffer else 30)
+            continue
+        last_render_key = render_key
+
         screen.fill(background)
-        if page == 0:
-            put(titles[page], 16, 14, title_font, blue)
-        dots = small_font.render("  ".join("◆" if i == page else "◇" for i in range(len(titles))), True, accent)
+        put(titles[page], 16, 14, title_font, blue)
+        dots = render_text(small_font, "  ".join("◆" if i == page else "◇" for i in range(len(titles))), accent)
         screen.blit(dots, ((args.width - dots.get_width()) // 2, 18))
         pygame.draw.line(screen, grid, (16, 48), (args.width - 16, 48))
         if data:
@@ -476,7 +496,6 @@ def main():
             if fetch_error:
                 put("Reconnecting...", 16, args.height - 27, small_font, error_color)
             else:
-                age = max(0.0, time.time() - float(data.get("timestamp", time.time())))
                 put(f"updated {age:.0f}s ago", 16, args.height - 27, small_font, muted)
         else:
             center("Waiting for stats server", 105, heading_font)
